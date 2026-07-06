@@ -1,0 +1,25 @@
+# Baseline store (auto-generated, contains absolute file paths)
+.metadata_store.json
+.metadata_store.json.tmp
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Virtual environment
+venv/
+.venv/
+env/

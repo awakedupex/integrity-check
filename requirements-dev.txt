@@ -1,0 +1,5 @@
+# Development dependencies for integrity_check.py
+# The tool itself uses only Python standard library (no install needed).
+# These packages are for testing and code quality only.
+
+pytest>=7.0
