@@ -15,17 +15,11 @@ import time
 
 import pytest
 
-# Path to the CLI tool (same directory as this test file)
 CLI = pathlib.Path(__file__).with_name("integrity_check.py")
 BASELINE = ".metadata_store.json"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def run(*args: str, cwd: pathlib.Path) -> subprocess.CompletedProcess:
-    """Invoke the CLI inside *cwd* and return the result."""
     return subprocess.run(
         [sys.executable, str(CLI), *args],
         capture_output=True,
@@ -41,7 +35,15 @@ def baseline_path(cwd: pathlib.Path) -> pathlib.Path:
 def assert_baseline_exists(cwd: pathlib.Path) -> dict:
     bp = baseline_path(cwd)
     assert bp.exists(), f"Baseline file {bp} not created"
-    return json.loads(bp.read_text(encoding="utf-8"))
+    data = json.loads(bp.read_text(encoding="utf-8"))
+    data.pop("_metadata", None)
+    return data
+
+
+def assert_baseline_metadata(cwd: pathlib.Path) -> dict:
+    bp = baseline_path(cwd)
+    data = json.loads(bp.read_text(encoding="utf-8"))
+    return data.get("_metadata", {})
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +59,6 @@ class TestInit:
 
         assert result.returncode == 0
         baseline = assert_baseline_exists(tmp_path)
-        # Both files should be present
         for key in baseline:
             p = pathlib.Path(key)
             assert p.exists()
@@ -86,6 +87,36 @@ class TestInit:
         result = run("init", str(tmp_path / "nope"), cwd=tmp_path)
         assert result.returncode == 1
 
+    def test_init_stores_metadata(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "test.log").write_text("data\n")
+
+        run("init", str(tmp_path), cwd=tmp_path)
+
+        metadata = assert_baseline_metadata(tmp_path)
+        assert "algorithm" in metadata
+        assert "created" in metadata
+        assert metadata["algorithm"] == "sha256"
+
+    def test_init_with_custom_algorithm(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "test.log").write_text("data\n")
+
+        result = run("init", "--algorithm", "sha512", str(tmp_path), cwd=tmp_path)
+
+        assert result.returncode == 0
+        metadata = assert_baseline_metadata(tmp_path)
+        assert metadata["algorithm"] == "sha512"
+
+    def test_init_with_exclude_pattern(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "keep.log").write_text("keep\n")
+        (tmp_path / "skip.tmp").write_text("skip\n")
+
+        result = run("init", "--exclude", "*.tmp", str(tmp_path), cwd=tmp_path)
+
+        assert result.returncode == 0
+        baseline = assert_baseline_exists(tmp_path)
+        assert len(baseline) == 1
+        assert "skip.tmp" not in str(list(baseline.keys())[0])
+
 
 # ---------------------------------------------------------------------------
 # check
@@ -103,18 +134,12 @@ class TestCheck:
         assert "Unmodified" in result.stdout
 
     def test_tamper_detection_midfile_insertion(self, tmp_path: pathlib.Path) -> None:
-        """Core tamper test: inject a character in the middle of the file.
-
-        This guarantees a hash mismatch.  The test asserts a 0 % false-negative
-        rate — any SHA-256 change must be reported as Modified.
-        """
         f = tmp_path / "messages.log"
         original_content = "Jan 01 12:00:00 host sshd[1234]: Accepted publickey\n" * 100
         f.write_text(original_content)
 
         run("init", str(tmp_path), cwd=tmp_path)
 
-        # Tamper: replace the 500th character with 'X'
         content = f.read_text(encoding="utf-8")
         pos = min(500, len(content) - 1)
         tampered = content[:pos] + "X" + content[pos + 1:]
@@ -130,7 +155,6 @@ class TestCheck:
         )
 
     def test_tamper_detection_append(self, tmp_path: pathlib.Path) -> None:
-        """Appending content also changes the hash — FIM must flag it."""
         f = tmp_path / "dmesg"
         f.write_text("original content\n")
 
@@ -160,6 +184,35 @@ class TestCheck:
         assert result.returncode == 1
         assert "No baseline found" in result.stderr
 
+    def test_check_json_output(self, tmp_path: pathlib.Path) -> None:
+        (tmp_path / "test.log").write_text("hello\n")
+        run("init", str(tmp_path), cwd=tmp_path)
+
+        result = run("check", "--json", str(tmp_path), cwd=tmp_path)
+
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        assert "timestamp" in output
+        assert "summary" in output
+        assert "results" in output
+        assert output["summary"]["unmodified"] == 1
+        assert output["results"][0]["status"] == "unmodified"
+
+    def test_check_json_output_with_tamper(self, tmp_path: pathlib.Path) -> None:
+        f = tmp_path / "test.log"
+        f.write_text("original\n")
+        run("init", str(tmp_path), cwd=tmp_path)
+
+        f.write_text("tampered\n")
+
+        result = run("check", "--json", str(tmp_path), cwd=tmp_path)
+
+        # Still valid JSON even on failure
+        output = json.loads(result.stdout)
+        assert output["summary"]["modified"] == 1
+        assert output["results"][0]["status"] == "modified"
+        assert result.returncode == 2
+
 
 # ---------------------------------------------------------------------------
 # update
@@ -174,7 +227,6 @@ class TestUpdate:
 
         run("init", str(tmp_path), cwd=tmp_path)
 
-        # Modify only f1
         f1.write_text("aaa\nCHANGED\n")
 
         result = run("update", str(f1), cwd=tmp_path)
@@ -182,10 +234,7 @@ class TestUpdate:
         assert result.returncode == 0
         baseline = assert_baseline_exists(tmp_path)
 
-        # f1's hash should now match the updated content (check passes)
         check_result = run("check", str(tmp_path), cwd=tmp_path)
-        assert "Unmodified" in check_result.stdout
-        # f2 was never touched
         assert "Unmodified" in check_result.stdout
 
 
@@ -195,17 +244,10 @@ class TestUpdate:
 
 class TestPermissions:
     def test_permission_denied_is_graceful(self, tmp_path: pathlib.Path) -> None:
-        """A directory with 000 permissions should not crash the tool.
-
-        Platform behaviour varies (some OSes raise PermissionError on rglob,
-        others silently skip).  The invariant is: the tool exits 0 and the
-        public file is still hashed.
-        """
         subdir = tmp_path / "restricted"
         subdir.mkdir()
         (subdir / "secret.log").write_text("classified\n")
 
-        # Make the directory inaccessible
         subdir.chmod(0o000)
 
         try:
@@ -217,26 +259,17 @@ class TestPermissions:
             baseline = assert_baseline_exists(tmp_path)
 
             baseline_paths = list(baseline.keys())
-            # At minimum the public file must be present (the restricted dir
-            # may or may not appear depending on OS rglob behaviour).
             assert any("public.log" in p for p in baseline_paths)
         finally:
-            # Restore permissions so tmp cleanup works
             subdir.chmod(stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
 
 
 # ---------------------------------------------------------------------------
-# Benchmarking — latency verification
+# Benchmarking
 # ---------------------------------------------------------------------------
 
 class TestBenchmark:
-    """Verify the tool completes init + check within a strict time budget.
-
-    The target is deliberately generous for CI environments but confirms that
-    chunked reads do not introduce pathological slowdowns.
-    """
-
-    BUDGET_MS = 500  # 500 ms for 20 small files
+    BUDGET_MS = 500
 
     def test_init_and_check_within_budget(self, tmp_path: pathlib.Path) -> None:
         files: list[pathlib.Path] = []
