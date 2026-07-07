@@ -1,0 +1,12 @@
+__pycache__
+.pytest_cache
+.git
+.gitignore
+Dockerfile
+README.md
+test_integrity.py
+requirements-dev.txt
+Makefile
+.DS_Store
+.metadata_store.json
+.metadata_store.json.tmp
